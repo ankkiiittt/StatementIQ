@@ -43,6 +43,7 @@ uploads/
 *.pdf
 !evals/data/**/*.pdf
 *.db
+*.db-*
 *.sqlite3
 
 # IDEs

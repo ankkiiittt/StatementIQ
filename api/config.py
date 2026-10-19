@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     statementiq_api_key: str | None = None
 
     # API URL
-    api_url: str = "http://localhost:8001"
+    api_url: str = "http://127.0.0.1:8001"
 
     # OCI Configuration
     oci_config_file: str = "~/.oci/config"

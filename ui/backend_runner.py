@@ -14,11 +14,17 @@ _backend_process: subprocess.Popen | None = None
 
 
 def is_backend_healthy(base_url: str) -> bool:
-    try:
-        r = requests.get(f"{base_url.rstrip('/')}/health", timeout=2)
-        return r.status_code == 200 and r.json().get("status") == "ok"
-    except Exception:
-        return False
+    urls_to_try = [base_url.rstrip("/")]
+    if "localhost" in base_url:
+        urls_to_try.append(base_url.replace("localhost", "127.0.0.1").rstrip("/"))
+    for u in urls_to_try:
+        try:
+            r = requests.get(f"{u}/health", timeout=2)
+            if r.status_code == 200 and r.json().get("status") == "ok":
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def ensure_backend_alive(api_url: str | None = None) -> bool:
@@ -50,6 +56,8 @@ def ensure_backend_alive(api_url: str | None = None) -> bool:
     if host not in ("127.0.0.1", "localhost", "0.0.0.0"):
         return False
 
+    listen_host = "0.0.0.0" if host in ("localhost", "127.0.0.1", "0.0.0.0") else host
+
     # Initialize DB and seed categories if needed
     try:
         from api.db.seed import seed_categories
@@ -64,7 +72,7 @@ def ensure_backend_alive(api_url: str | None = None) -> bool:
 
     # If backend process was already launched and is running, just wait for it
     if _backend_process is not None and _backend_process.poll() is None:
-        for _ in range(20):
+        for _ in range(15):
             time.sleep(0.5)
             if is_backend_healthy(base_url):
                 return True
@@ -77,7 +85,7 @@ def ensure_backend_alive(api_url: str | None = None) -> bool:
         "uvicorn",
         "api.main:app",
         "--host",
-        host,
+        listen_host,
         "--port",
         str(port),
         "--log-level",

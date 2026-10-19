@@ -1,4 +1,8 @@
-"""API client for communicating with the FastAPI backend."""
+"""API client for communicating with the FastAPI backend.
+
+Supports both external HTTP backend communication and zero-config in-process
+execution for standalone environments like Streamlit Community Cloud.
+"""
 import os
 import uuid
 from datetime import date
@@ -8,23 +12,93 @@ import requests
 
 from api.config import settings
 
-API_URL = os.getenv("API_URL", settings.api_url)
+# Force 127.0.0.1 instead of localhost to prevent Linux IPv6 ::1 resolution errors
+RAW_API_URL = os.getenv("API_URL", settings.api_url)
+if "localhost" in RAW_API_URL:
+    RAW_API_URL = RAW_API_URL.replace("localhost", "127.0.0.1")
+
+API_URL = RAW_API_URL
+
+
+class UnifiedResponse:
+    """Wrapper that unifies requests.Response and httpx.Response interface."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self.status_code = raw.status_code
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status_code < 400
+
+    def json(self) -> Any:
+        return self._raw.json()
+
+    def raise_for_status(self):
+        self._raw.raise_for_status()
+
+    @property
+    def text(self) -> str:
+        return self._raw.text
 
 
 class APIClient:
     def __init__(self, base_url: str = API_URL):
-        self.base_url = base_url.rstrip("/")
+        self._base_url = base_url.rstrip("/")
+        self._in_process_client = None
+
+    @property
+    def base_url(self) -> str:
+        url = os.getenv("API_URL", self._base_url)
+        if "localhost" in url:
+            url = url.replace("localhost", "127.0.0.1")
+        return url.rstrip("/")
+
+    def _get_direct_client(self):
+        if self._in_process_client is None:
+            try:
+                from fastapi.testclient import TestClient
+
+                from api.db.session import init_db
+                from api.main import app
+
+                init_db()
+                self._in_process_client = TestClient(app)
+            except Exception as exc:
+                print(f"[StatementIQ] Direct in-process client init error: {exc}")
+                return None
+        return self._in_process_client
+
+    def _request(self, method: str, path: str, **kwargs) -> UnifiedResponse:
+        endpoint = path if path.startswith("/") else f"/{path}"
+        url = f"{self.base_url}{endpoint}"
+
+        # If base_url points to localhost / 127.0.0.1, try HTTP with immediate in-process fallback
+        is_local = "127.0.0.1" in self.base_url or "localhost" in self.base_url
+
+        try:
+            timeout = kwargs.pop("timeout", 10)
+            res = requests.request(method, url, timeout=timeout, **kwargs)
+            return UnifiedResponse(res)
+        except Exception as exc:
+            # Fall back to in-process execution on connection failure for standalone deployments
+            if is_local:
+                direct = self._get_direct_client()
+                if direct is not None:
+                    direct_res = direct.request(method, endpoint, **kwargs)
+                    return UnifiedResponse(direct_res)
+            raise exc
 
     def health(self) -> bool:
         try:
-            r = requests.get(f"{self.base_url}/health", timeout=3)
+            r = self._request("GET", "/health", timeout=2)
             return r.status_code == 200 and r.json().get("status") == "ok"
         except Exception:
             return False
 
     def get_categories(self) -> list[dict[str, Any]]:
         try:
-            r = requests.get(f"{self.base_url}/categories", timeout=5)
+            r = self._request("GET", "/categories", timeout=5)
             r.raise_for_status()
             return r.json()
         except Exception:
@@ -32,7 +106,7 @@ class APIClient:
 
     def list_statements(self) -> list[dict[str, Any]]:
         try:
-            r = requests.get(f"{self.base_url}/statements", timeout=10)
+            r = self._request("GET", "/statements", timeout=10)
             r.raise_for_status()
             return r.json()
         except Exception as exc:
@@ -40,7 +114,7 @@ class APIClient:
 
     def get_statement(self, statement_id: uuid.UUID | str) -> dict[str, Any] | None:
         try:
-            r = requests.get(f"{self.base_url}/statements/{statement_id}", timeout=5)
+            r = self._request("GET", f"/statements/{statement_id}", timeout=5)
             if r.status_code == 404:
                 return None
             r.raise_for_status()
@@ -50,7 +124,7 @@ class APIClient:
 
     def upload_statement(self, filename: str, content: bytes) -> dict[str, Any]:
         files = {"file": (filename, content, "application/pdf")}
-        r = requests.post(f"{self.base_url}/statements", files=files, timeout=60)
+        r = self._request("POST", "/statements", files=files, timeout=60)
         if not r.ok:
             error_detail = "Failed to upload statement."
             try:
@@ -86,7 +160,7 @@ class APIClient:
         if end_date:
             params["end_date"] = end_date.isoformat()
 
-        r = requests.get(f"{self.base_url}/statements/{statement_id}/transactions", params=params, timeout=10)
+        r = self._request("GET", f"/statements/{statement_id}/transactions", params=params, timeout=10)
         r.raise_for_status()
         return r.json()
 
@@ -102,27 +176,27 @@ class APIClient:
         if description_clean is not None:
             payload["description_clean"] = description_clean
 
-        r = requests.patch(f"{self.base_url}/transactions/{transaction_id}", json=payload, timeout=5)
+        r = self._request("PATCH", f"/transactions/{transaction_id}", json=payload, timeout=5)
         r.raise_for_status()
         return r.json()
 
     def delete_transaction(self, transaction_id: uuid.UUID | str) -> bool:
-        r = requests.delete(f"{self.base_url}/transactions/{transaction_id}", timeout=5)
+        r = self._request("DELETE", f"/transactions/{transaction_id}", timeout=5)
         r.raise_for_status()
         return r.json().get("deleted", False)
 
     def confirm_statement(self, statement_id: uuid.UUID | str) -> dict[str, Any]:
-        r = requests.post(f"{self.base_url}/statements/{statement_id}/confirm", timeout=5)
+        r = self._request("POST", f"/statements/{statement_id}/confirm", timeout=5)
         r.raise_for_status()
         return r.json()
 
     def retry_statement(self, statement_id: uuid.UUID | str) -> dict[str, Any]:
-        r = requests.post(f"{self.base_url}/statements/{statement_id}/retry", timeout=60)
+        r = self._request("POST", f"/statements/{statement_id}/retry", timeout=60)
         r.raise_for_status()
         return r.json()
 
     def delete_statement(self, statement_id: uuid.UUID | str) -> bool:
-        r = requests.delete(f"{self.base_url}/statements/{statement_id}", timeout=10)
+        r = self._request("DELETE", f"/statements/{statement_id}", timeout=10)
         r.raise_for_status()
         return r.json().get("deleted", False)
 
@@ -140,7 +214,7 @@ class APIClient:
         if end_date:
             params["end_date"] = end_date.isoformat()
 
-        r = requests.get(f"{self.base_url}/insights", params=params, timeout=10)
+        r = self._request("GET", "/insights", params=params, timeout=10)
         r.raise_for_status()
         return r.json()
 
@@ -152,12 +226,12 @@ class APIClient:
         payload: dict[str, Any] = {"message": message}
         if session_id:
             payload["session_id"] = str(session_id)
-        r = requests.post(f"{self.base_url}/chat", json=payload, timeout=30)
+        r = self._request("POST", "/chat", json=payload, timeout=30)
         r.raise_for_status()
         return r.json()
 
     def get_chat_history(self, session_id: uuid.UUID | str) -> list[dict[str, Any]]:
-        r = requests.get(f"{self.base_url}/chat/{session_id}", timeout=10)
+        r = self._request("GET", f"/chat/{session_id}", timeout=10)
         r.raise_for_status()
         return r.json()
 

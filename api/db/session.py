@@ -4,6 +4,7 @@ from collections.abc import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import api.db.models  # noqa: F401 - ensure all tables are registered on Base.metadata
 from api.config import settings
 from api.db.base import Base
 from api.db.seed import seed_categories
@@ -27,7 +28,10 @@ if settings.database_url.startswith("sqlite"):
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA journal_mode=WAL")
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
         cursor.close()
 
 session_factory = sessionmaker(
